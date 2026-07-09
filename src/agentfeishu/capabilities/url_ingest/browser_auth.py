@@ -1,0 +1,211 @@
+"""Project-local browser authorization helpers for URL ingestion."""
+
+from __future__ import annotations
+
+import urllib.parse
+from dataclasses import dataclass
+from pathlib import Path
+
+from agentfeishu.config import Settings
+from agentfeishu.core.models import AuthState, Evidence, Limitation
+
+from .dependencies import has_python_package
+from .models import UrlIngestReport
+
+
+DEFAULT_AUTH_TARGETS = {
+    "douyin": "https://www.douyin.com/",
+}
+
+
+@dataclass(frozen=True)
+class BrowserAuthTarget:
+    site: str
+    login_url: str
+    profile_dir: Path
+    state: AuthState
+
+
+def site_key_from_url(url: str) -> str:
+    host = urllib.parse.urlparse(url).netloc.lower() or "default"
+    return host.replace(".", "_").replace(":", "_")
+
+
+def profile_dir_for_url(settings: Settings, url: str) -> Path:
+    return settings.site_profile_dir(site_key_from_url(url))
+
+
+def profile_state(profile_dir: Path) -> AuthState:
+    if not profile_dir.exists():
+        return AuthState.REQUIRED
+    try:
+        if any(profile_dir.iterdir()):
+            return AuthState.READY
+    except OSError:
+        return AuthState.UNKNOWN
+    return AuthState.REQUIRED
+
+
+def auth_targets(settings: Settings) -> tuple[BrowserAuthTarget, ...]:
+    targets = []
+    configured = settings.capability_settings.get("url_ingest", {}).get("auth_targets")
+    raw_targets = configured if isinstance(configured, dict) else DEFAULT_AUTH_TARGETS
+    for site, login_url in raw_targets.items():
+        if not isinstance(login_url, str) or not login_url:
+            continue
+        profile_dir = profile_dir_for_url(settings, login_url)
+        targets.append(BrowserAuthTarget(
+            site=str(site),
+            login_url=login_url,
+            profile_dir=profile_dir,
+            state=profile_state(profile_dir),
+        ))
+    return tuple(targets)
+
+
+def aggregate_auth_state(settings: Settings) -> AuthState:
+    states = {target.state for target in auth_targets(settings)}
+    if AuthState.READY in states:
+        return AuthState.READY
+    if AuthState.REQUIRED in states:
+        return AuthState.REQUIRED
+    return AuthState.UNKNOWN
+
+
+def open_browser_login(settings: Settings, url: str) -> dict[str, str]:
+    """Open a headed persistent browser profile for user login.
+
+    The call blocks until the browser window is closed. This is intentional for
+    the CLI command; the HTTP API starts it in a background thread.
+    """
+
+    if not has_python_package("playwright"):
+        raise RuntimeError(
+            "playwright is not installed; run: pip install -e '.[url-ingest]' "
+            "&& python -m playwright install chromium"
+        )
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional package
+        raise RuntimeError(str(exc)) from exc
+
+    profile_dir = profile_dir_for_url(settings, url)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as playwright:
+        context = playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=False,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        page.wait_for_timeout(1_000)
+        while True:
+            pages = [item for item in context.pages if not item.is_closed()]
+            if not pages:
+                break
+            try:
+                pages[0].wait_for_timeout(1_000)
+            except Exception:
+                break
+        try:
+            context.close()
+        except Exception:
+            pass
+    return {"url": url, "profile_dir": str(profile_dir), "state": "closed"}
+
+
+def try_browser_extract(url: str, settings: Settings,
+                        timeout_s: int = 20) -> UrlIngestReport | None:
+    """Try reading a page with an existing persistent browser profile."""
+
+    if not has_python_package("playwright"):
+        return None
+    profile_dir = profile_dir_for_url(settings, url)
+    if profile_state(profile_dir) is not AuthState.READY:
+        return None
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                headless=True,
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
+            title = page.title()
+            body_text = ""
+            try:
+                body_text = page.locator("body").inner_text(timeout=2_000)
+            except Exception:
+                body_text = ""
+            current_url = page.url
+            context.close()
+    except Exception as exc:
+        return UrlIngestReport(
+            input_url=url,
+            resolved_url=url,
+            content_type="dynamic_page",
+            evidence=(Evidence(
+                kind="extractor_error",
+                value=str(exc),
+                source="playwright",
+            ),),
+            limitations=(Limitation(
+                code="browser_extract_failed",
+                message=str(exc),
+                recoverable=True,
+                next_action="open_browser_login",
+            ),),
+        )
+
+    evidence = (
+        Evidence(kind="extractor", value="playwright", source=current_url),
+        Evidence(
+            kind="browser_profile",
+            value=str(profile_dir),
+            source=site_key_from_url(url),
+            confidence="high",
+        ),
+    )
+    if _looks_like_login_state(current_url, title, body_text):
+        return UrlIngestReport(
+            input_url=url,
+            resolved_url=current_url,
+            content_type="dynamic_page",
+            title=title,
+            text=body_text[:2000],
+            evidence=evidence,
+            limitations=(Limitation(
+                code="needs_browser_auth",
+                message="Stored browser profile is missing or has expired login state.",
+                recoverable=True,
+                next_action="open_browser_login",
+            ),),
+        )
+    return UrlIngestReport(
+        input_url=url,
+        resolved_url=current_url,
+        content_type="browser_page",
+        title=title,
+        text=body_text[:4000],
+        evidence=evidence,
+    )
+
+
+def _looks_like_login_state(url: str, title: str, body_text: str) -> bool:
+    low = " ".join([url, title, body_text[:500]]).lower()
+    return any(
+        marker in low
+        for marker in (
+            "login",
+            "sign in",
+            "登录",
+            "验证码",
+            "captcha",
+            "verify",
+        )
+    )
