@@ -16,12 +16,19 @@ from .models import (
     TaskStatus,
 )
 from .registry import Capability, CapabilityRegistry
-from .runtime import AgentRuntime, LocalExecutionAdapter, RuntimeContext, TaskRuntime
+from .runtime import (
+    AgentRuntime,
+    BackgroundTaskRuntime,
+    LocalExecutionAdapter,
+    RuntimeContext,
+    TaskRuntime,
+)
 from .task_store import InMemoryTaskStore
 
 __all__ = [
     "AgentRuntime",
     "AuthState",
+    "BackgroundTaskRuntime",
     "Capability",
     "CapabilityDescriptor",
     "CapabilityHealth",

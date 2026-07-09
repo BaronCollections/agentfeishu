@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from http import HTTPStatus
@@ -10,6 +11,14 @@ from http.server import ThreadingHTTPServer
 from agentfeishu.capabilities import default_registry
 from agentfeishu.capabilities.url_ingest import extractors
 from agentfeishu.config import load_settings
+from agentfeishu.core import (
+    CapabilityDescriptor,
+    CapabilityHealth,
+    CapabilityRegistry,
+    RuntimeContext,
+    RuntimeRequest,
+)
+from agentfeishu.core.task_store import TaskStore
 import agentfeishu.server as server_module
 from agentfeishu.server import build_overview, make_handler
 
@@ -119,11 +128,53 @@ def test_feishu_message_routes_url_to_runtime(monkeypatch, tmp_path):
             },
         )
         task = response["data"]["task"]
-        assert response["status"] == HTTPStatus.OK
+        assert response["status"] == HTTPStatus.ACCEPTED
         assert task["capability"] == "url_ingest"
-        assert task["status"] == "succeeded"
+        assert task["status"] == "queued"
         assert task["request"]["sender_id"] == "ou_1"
+        assert _wait_for_task_status(settings, task["id"], "succeeded")
     finally:
+        server.RequestHandlerClass.shutdown_runtime()
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_feishu_message_is_accepted_before_capability_finishes(tmp_path):
+    capability = BlockingUrlCapability()
+    registry = CapabilityRegistry()
+    registry.register(capability)
+    settings = load_settings(tmp_path)
+    server, thread = _start_server(settings, registry)
+    try:
+        port = server.server_address[1]
+        started = time.monotonic()
+        response = _post_json(
+            f"http://127.0.0.1:{port}/feishu/events",
+            {
+                "event": {
+                    "sender": {"sender_id": {"open_id": "ou_1"}},
+                    "message": {
+                        "message_id": "om_1",
+                        "chat_id": "oc_1",
+                        "message_type": "text",
+                        "content": '{"text":"解析 https://example.com/video"}',
+                    },
+                }
+            },
+        )
+        elapsed = time.monotonic() - started
+        task = response["data"]["task"]
+
+        assert response["status"] == HTTPStatus.ACCEPTED
+        assert elapsed < 0.5
+        assert task["status"] == "queued"
+        assert capability.started.wait(timeout=2)
+
+        capability.release.set()
+        assert _wait_for_task_status(settings, task["id"], "succeeded")
+    finally:
+        capability.release.set()
+        server.RequestHandlerClass.shutdown_runtime()
         server.shutdown()
         thread.join(timeout=5)
 
@@ -146,12 +197,44 @@ def test_browser_auth_endpoint_reports_missing_optional_dependency(monkeypatch, 
         thread.join(timeout=5)
 
 
-def _start_server(settings):
-    handler = make_handler(settings, default_registry())
+class BlockingUrlCapability:
+    descriptor = CapabilityDescriptor(
+        capability_id="url_ingest",
+        name="URL Ingest",
+        description="Blocking URL ingest test double.",
+    )
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def health(self, settings):
+        return CapabilityHealth(name="url_ingest", enabled=True, status="ready")
+
+    def execute(self, request: RuntimeRequest, context: RuntimeContext):
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test did not release blocking URL capability")
+        return {"status": "ok", "url": request.urls[0]}
+
+
+def _start_server(settings, registry=None):
+    handler = make_handler(settings, registry or default_registry())
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread
+
+
+def _wait_for_task_status(settings, task_id, status):
+    deadline = time.monotonic() + 3
+    store = TaskStore(settings.task_store_path)
+    while time.monotonic() < deadline:
+        tasks = {task["id"]: task for task in store.list(limit=0)}
+        if tasks.get(task_id, {}).get("status") == status:
+            return True
+        time.sleep(0.01)
+    return False
 
 
 def _post_json(url, payload, *, expect_error=False):

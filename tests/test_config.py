@@ -31,3 +31,12 @@ def test_enabled_capabilities_from_config(tmp_path):
     )
     settings = load_settings(tmp_path)
     assert settings.enabled_capabilities == ("url_ingest", "research")
+
+
+def test_runtime_max_workers_from_config(tmp_path):
+    (tmp_path / "agentfeishu.toml").write_text(
+        "[runtime]\nmax_workers = 8\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(tmp_path)
+    assert settings.runtime_max_workers == 8

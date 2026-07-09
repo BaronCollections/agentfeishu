@@ -53,6 +53,7 @@ class Settings:
     feishu_app_secret: str = ""
     feishu_verification_token: str = ""
     codex_command: str = "codex"
+    runtime_max_workers: int = 4
     enabled_capabilities: tuple[str, ...] = ()
     capability_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
     raw_config: dict[str, Any] = field(default_factory=dict)
@@ -107,6 +108,7 @@ class Settings:
             "feishu_app_secret": self.feishu_app_secret,
             "feishu_verification_token": self.feishu_verification_token,
             "codex_command": self.codex_command,
+            "runtime_max_workers": self.runtime_max_workers,
             "enabled_capabilities": list(self.enabled_capabilities),
         }
         return {
@@ -186,6 +188,11 @@ def load_settings(project_root: Path | None = None,
         codex_command=os.environ.get(
             "AGENTFEISHU_CODEX_COMMAND",
             str(runtime.get("codex_command", "codex"))),
+        runtime_max_workers=_positive_int_from_env_or_config(
+            "AGENTFEISHU_RUNTIME_MAX_WORKERS",
+            runtime.get("max_workers"),
+            4,
+        ),
         enabled_capabilities=enabled_tuple,
         capability_settings={
             str(key): value
@@ -197,3 +204,19 @@ def load_settings(project_root: Path | None = None,
     if create_dirs:
         settings.ensure_directories()
     return settings
+
+
+def _positive_int_from_env_or_config(name: str, config_value: Any,
+                                     default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = config_value
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value

@@ -6,14 +6,15 @@ AgentFeishu is an open-source framework for controlling Codex-powered agents fro
 
 - Feishu message normalization and routing contracts.
 - A capability registry for business abilities.
-- A runtime task state machine with durable local task logs.
+- A runtime task state machine with durable local task logs and bounded
+  background workers for concurrent group messages.
 - A URL ingestion capability for video, image, gallery, and article links.
 - A lightweight admin console showing supported capabilities, dependencies, configuration, auth state, recent tasks, and errors.
 
 ## Architecture
 
 ```text
-Feishu Gateway -> Runtime -> Capability Registry -> Capability Executor
+Feishu Gateway -> Background Runtime -> Capability Registry -> Capability Executor
                                 |
                                 +-> Admin UI/API
 ```
@@ -102,11 +103,19 @@ Example config:
 [feishu]
 verification_token = "your-callback-token"
 
+[runtime]
+max_workers = 4
+
 [capabilities]
 enabled = ["url_ingest"]
 ```
 
 Text messages containing URLs are normalized, routed to `url_ingest`, submitted to the runtime, and persisted in the local task log.
+The callback enqueues work and returns `202 Accepted` with a `queued` task quickly;
+worker threads then move the task through `running` to `succeeded`, `failed`,
+`rejected`, or `needs_auth`. This lets multiple Feishu groups or users submit
+work concurrently without tying long video parsing to the Feishu callback request.
+`AGENTFEISHU_RUNTIME_MAX_WORKERS` overrides `[runtime].max_workers`.
 
 ## Admin UI
 

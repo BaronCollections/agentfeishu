@@ -75,7 +75,7 @@ def dashboard_html() -> str:
     .muted { color: var(--muted); }
     .status { font-weight: 700; }
     .ready, .available, .running, .succeeded { color: var(--ok); }
-    .degraded, .optional, .waiting_for_auth { color: var(--warn); }
+    .degraded, .optional, .pending, .queued, .waiting_for_auth { color: var(--warn); }
     .missing, .failed, .error { color: var(--bad); }
     .wide { grid-column: 1 / -1; }
     button {

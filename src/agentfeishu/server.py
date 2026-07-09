@@ -17,7 +17,7 @@ from agentfeishu.capabilities.url_ingest.browser_auth import (
 )
 from agentfeishu.capabilities.url_ingest.dependencies import has_python_package
 from agentfeishu.config import Settings, load_settings
-from agentfeishu.core import CapabilityRegistry, TaskRuntime
+from agentfeishu.core import BackgroundTaskRuntime, CapabilityRegistry
 from agentfeishu.core.models import to_jsonable
 from agentfeishu.core.task_store import TaskStore
 from agentfeishu.gateway import FeishuEventNormalizer, GatewayCommandRouter
@@ -51,10 +51,21 @@ def serve(*, settings: Settings | None = None,
     handler = make_handler(settings, registry)
     httpd = ThreadingHTTPServer((host, port), handler)
     print(f"AgentFeishu admin UI: http://{host}:{port}/admin")
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    finally:
+        handler.shutdown_runtime()
+        httpd.server_close()
 
 
 def make_handler(settings: Settings, registry: CapabilityRegistry):
+    task_store = TaskStore(settings.task_store_path)
+    background_runtime = BackgroundTaskRuntime(
+        registry=registry,
+        task_store=task_store,
+        settings=settings,
+    )
+
     class AdminHandler(BaseHTTPRequestHandler):
         server_version = "AgentFeishuAdmin/0.1"
 
@@ -73,7 +84,7 @@ def make_handler(settings: Settings, registry: CapabilityRegistry):
                 return
             if parsed.path in {"/admin/api/tasks", "/api/tasks"}:
                 limit = _limit_from_query(parsed.query, 20)
-                self._send_json(TaskStore(settings.task_store_path).list(limit=limit))
+                self._send_json(task_store.list(limit=limit))
                 return
             if parsed.path in {"/admin/api/config", "/api/config"}:
                 self._send_json(settings.masked_configuration())
@@ -174,13 +185,8 @@ def make_handler(settings: Settings, registry: CapabilityRegistry):
 
             message = FeishuEventNormalizer().normalize(payload)
             runtime_request = GatewayCommandRouter().route(message)
-            runtime = TaskRuntime(
-                registry=registry,
-                task_store=TaskStore(settings.task_store_path),
-                settings=settings,
-            )
-            task = runtime.submit(runtime_request)
-            self._send_json({"code": 0, "task": to_jsonable(task)})
+            task = background_runtime.submit(runtime_request)
+            self._send_json({"code": 0, "task": to_jsonable(task)}, HTTPStatus.ACCEPTED)
 
         def _handle_open_browser_auth(self) -> None:
             payload = self._read_json_body()
@@ -216,6 +222,10 @@ def make_handler(settings: Settings, registry: CapabilityRegistry):
                 return True
             self._send_json({"error": "admin_api_requires_localhost"}, HTTPStatus.FORBIDDEN)
             return False
+
+        @staticmethod
+        def shutdown_runtime() -> None:
+            background_runtime.shutdown(wait=False, cancel_futures=False)
 
     return AdminHandler
 

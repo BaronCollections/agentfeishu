@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
+import threading
 from typing import Any, Protocol
 
 from agentfeishu.config import Settings
@@ -57,21 +59,18 @@ class TaskRuntime:
         self.execution_adapter = execution_adapter or LocalExecutionAdapter()
 
     def submit(self, request: RuntimeRequest) -> Task:
-        capability_id = request.capability_id or request.capability_hint
-        capability_request = CapabilityRequest(
-            capability=capability_id or "unknown",
-            payload={
-                "text": request.text,
-                "command": request.command,
-                "urls": list(request.urls),
-            },
-            raw_text=request.text,
-            sender_id=request.actor_id or request.sender_id,
-            source=request.source,
-            metadata=request.metadata,
-        )
-        task = self.task_store.create(Task.create(capability_request, status=TaskStatus.PENDING))
+        task = self.create_task(request, status=TaskStatus.PENDING)
+        return self.execute_task(task, request)
 
+    def create_task(self, request: RuntimeRequest, *,
+                    status: TaskStatus = TaskStatus.PENDING) -> Task:
+        return self.task_store.create(Task.create(
+            self._capability_request(request),
+            status=status,
+        ))
+
+    def execute_task(self, task: Task, request: RuntimeRequest) -> Task:
+        capability_id = request.capability_id or request.capability_hint
         try:
             capability = self.registry.get(capability_id)
         except KeyError:
@@ -93,7 +92,18 @@ class TaskRuntime:
                 "missing permissions: " + ", ".join(sorted(missing_permissions)),
             )
 
-        checks = self._dependency_checks(capability)
+        try:
+            checks = self._dependency_checks(capability)
+        except Exception as exc:
+            failed = task.transition(
+                TaskStatus.FAILED,
+                error=RuntimeErrorInfo(
+                    code="runtime_failed",
+                    message=str(exc),
+                    recoverable=True,
+                ),
+            )
+            return self.task_store.update(failed)
         unavailable = [
             check for check in checks
             if check.required and not check.ok
@@ -127,6 +137,21 @@ class TaskRuntime:
         finished = running.transition(status, result=result)
         return self.task_store.update(finished)
 
+    def _capability_request(self, request: RuntimeRequest) -> CapabilityRequest:
+        capability_id = request.capability_id or request.capability_hint
+        return CapabilityRequest(
+            capability=capability_id or "unknown",
+            payload={
+                "text": request.text,
+                "command": request.command,
+                "urls": list(request.urls),
+            },
+            raw_text=request.text,
+            sender_id=request.actor_id or request.sender_id,
+            source=request.source,
+            metadata=request.metadata,
+        )
+
     def _dependency_checks(self, capability: Any) -> list[DependencyCheck]:
         return list(normalize_health(capability, self.settings).dependencies)
 
@@ -138,6 +163,101 @@ class TaskRuntime:
             dependency_checks=dependency_checks,
         )
         return self.task_store.update(rejected)
+
+
+class BackgroundTaskRuntime:
+    """Queue-backed runtime for Feishu callbacks and other interactive gateways."""
+
+    def __init__(self, registry: CapabilityRegistry,
+                 task_store: TaskStateStore,
+                 settings: Settings,
+                 execution_adapter: LocalExecutionAdapter | None = None,
+                 *,
+                 max_workers: int | None = None) -> None:
+        workers = max_workers if max_workers is not None else settings.runtime_max_workers
+        if workers < 1:
+            raise ValueError("max_workers must be at least 1")
+        self._runtime = TaskRuntime(
+            registry=registry,
+            task_store=task_store,
+            settings=settings,
+            execution_adapter=execution_adapter,
+        )
+        self._executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="agentfeishu-task",
+        )
+        self._futures: dict[str, Future[Task]] = {}
+        self._tasks: dict[str, Task] = {}
+        self._lock = threading.Lock()
+
+    def submit(self, request: RuntimeRequest) -> Task:
+        task = self._runtime.create_task(request, status=TaskStatus.QUEUED)
+        try:
+            future = self._executor.submit(self._runtime.execute_task, task, request)
+        except RuntimeError as exc:
+            failed = task.transition(
+                TaskStatus.FAILED,
+                error=RuntimeErrorInfo(
+                    code="queue_unavailable",
+                    message=str(exc),
+                    recoverable=True,
+                ),
+            )
+            return self._runtime.task_store.update(failed)
+        with self._lock:
+            self._futures[task.task_id] = future
+            self._tasks[task.task_id] = task
+        future.add_done_callback(lambda done, task_id=task.task_id: self._finish(task_id, done))
+        return task
+
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def _finish(self, task_id: str, future: Future[Task]) -> None:
+        with self._lock:
+            self._futures.pop(task_id, None)
+            task = self._tasks.pop(task_id, None)
+        if future.cancelled():
+            if task is not None:
+                cancelled = task.transition(
+                    TaskStatus.CANCELLED,
+                    error=RuntimeErrorInfo(
+                        code="task_cancelled",
+                        message="task cancelled before execution",
+                        recoverable=True,
+                    ),
+                )
+                self._runtime.task_store.update(cancelled)
+            return
+        try:
+            future.result()
+        except CancelledError:
+            if task is not None:
+                cancelled = task.transition(
+                    TaskStatus.CANCELLED,
+                    error=RuntimeErrorInfo(
+                        code="task_cancelled",
+                        message="task cancelled before execution",
+                        recoverable=True,
+                    ),
+                )
+                self._runtime.task_store.update(cancelled)
+        except Exception as exc:
+            # execute_task captures capability exceptions. Reaching this boundary
+            # means queue/runtime orchestration itself failed; keep the process up.
+            if task is not None:
+                failed = task.transition(
+                    TaskStatus.FAILED,
+                    error=RuntimeErrorInfo(
+                        code="runtime_failed",
+                        message=str(exc),
+                        recoverable=True,
+                    ),
+                )
+                self._runtime.task_store.update(failed)
+            else:
+                print(f"AgentFeishu background task {task_id} failed: {exc}")
 
 
 class AgentRuntime:
