@@ -54,6 +54,7 @@ class Settings:
     feishu_verification_token: str = ""
     codex_command: str = "codex"
     runtime_max_workers: int = 4
+    local_auth_base_url: str = "http://127.0.0.1:8765"
     enabled_capabilities: tuple[str, ...] = ()
     capability_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
     raw_config: dict[str, Any] = field(default_factory=dict)
@@ -80,6 +81,10 @@ class Settings:
     @property
     def error_log_path(self) -> Path:
         return self.state_dir / "errors.jsonl"
+
+    @property
+    def local_auth_secret_path(self) -> Path:
+        return self.state_dir / "local_auth_secret"
 
     def ensure_directories(self) -> None:
         for path in (
@@ -109,6 +114,7 @@ class Settings:
             "feishu_verification_token": self.feishu_verification_token,
             "codex_command": self.codex_command,
             "runtime_max_workers": self.runtime_max_workers,
+            "local_auth_base_url": self.local_auth_base_url,
             "enabled_capabilities": list(self.enabled_capabilities),
         }
         return {
@@ -159,6 +165,7 @@ def load_settings(project_root: Path | None = None,
     paths = raw.get("paths") or {}
     feishu = raw.get("feishu") or {}
     runtime = raw.get("runtime") or {}
+    server = raw.get("server") or {}
     capabilities = raw.get("capabilities") or {}
     enabled = capabilities.get("enabled") or ()
     if isinstance(enabled, str):
@@ -193,6 +200,10 @@ def load_settings(project_root: Path | None = None,
             runtime.get("max_workers"),
             4,
         ),
+        local_auth_base_url=os.environ.get(
+            "AGENTFEISHU_BASE_URL",
+            str(server.get("base_url", "http://127.0.0.1:8765")),
+        ).rstrip("/"),
         enabled_capabilities=enabled_tuple,
         capability_settings={
             str(key): value

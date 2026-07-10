@@ -40,3 +40,12 @@ def test_runtime_max_workers_from_config(tmp_path):
     )
     settings = load_settings(tmp_path)
     assert settings.runtime_max_workers == 8
+
+
+def test_local_auth_base_url_from_config(tmp_path):
+    (tmp_path / "agentfeishu.toml").write_text(
+        '[server]\nbase_url = "http://127.0.0.1:9999/"\n',
+        encoding="utf-8",
+    )
+    settings = load_settings(tmp_path)
+    assert settings.local_auth_base_url == "http://127.0.0.1:9999"

@@ -99,6 +99,9 @@ def _print_task_summary(task) -> None:
         print(f"summary: {task.result.summary}")
         if task.result.next_action:
             print(f"next_action: {task.result.next_action}")
+        auth_url = task.result.data.get("auth_url") if task.result.data else ""
+        if auth_url:
+            print(f"auth_url: {auth_url}")
         if task.result.limitations:
             print("limitations:")
             for item in task.result.limitations:

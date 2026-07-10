@@ -204,6 +204,9 @@ class Task:
         now = utc_now()
         started = self.started_at
         finished = self.finished_at
+        if status in {TaskStatus.PENDING, TaskStatus.QUEUED}:
+            started = None
+            finished = None
         if status == TaskStatus.RUNNING and started is None:
             started = now
         if status in {

@@ -79,6 +79,27 @@ agentfeishu auth login "https://www.douyin.com/"
 
 This opens a headed browser using a project-local persistent profile. After you login and close the browser window, later URL parsing can reuse that profile. Profiles live under `state/browser_profiles/` and are ignored by git.
 
+When the admin server is running, `needs_browser_auth` results also include a
+signed local `auth_url` such as:
+
+```text
+http://127.0.0.1:8765/auth/start?task_id=...&token=...
+```
+
+Open that link on the machine running AgentFeishu, click **Open Browser Login**,
+complete the site login, and close the browser window. AgentFeishu then requeues
+the original task with the same task id and reuses the saved project-local
+browser profile. The page also keeps **Continue Parsing** as a manual fallback.
+Configure the link base with:
+
+```toml
+[server]
+base_url = "http://127.0.0.1:8765"
+```
+
+or `AGENTFEISHU_BASE_URL`. The auth link is signed with a local secret stored
+under `state/local_auth_secret`, which is not committed to git.
+
 HTTP `401`, `403`, and `407` are reported as authorization requirements. HTTP `429` is reported as a rate-limit or anti-automation limitation instead of guessed content.
 
 ## Feishu Callback
@@ -138,6 +159,10 @@ Automation-friendly API endpoints are also exposed:
 - `GET /api/tasks?limit=20`
 - `GET /api/config`
 - `POST /api/auth/browser/open`
+- `GET /auth/start?task_id=...&token=...`
+- `GET /api/auth/sessions?task_id=...&token=...`
+- `POST /api/tasks/{task_id}/auth/open`
+- `POST /api/tasks/{task_id}/resume`
 
 Admin endpoints are intended for local operation. Requests from non-loopback clients are rejected unless `AGENTFEISHU_ALLOW_REMOTE_ADMIN=true` is explicitly set. Feishu callbacks are separate and protected by the Feishu verification token when configured.
 

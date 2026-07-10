@@ -95,6 +95,10 @@ class TaskStore:
             return latest
         return latest[-limit:]
 
+    def get(self, task_id: str) -> dict:
+        latest = self.latest_by_id()
+        return latest[task_id]
+
     def latest_by_id(self) -> dict[str, dict]:
         latest: dict[str, dict] = {}
         for row in self.events(limit=0):

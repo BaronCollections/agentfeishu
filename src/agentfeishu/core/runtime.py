@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from agentfeishu.config import Settings
 
+from .auth_links import attach_auth_url
 from .models import (
     CapabilityRequest,
     CapabilityResult,
@@ -134,6 +135,8 @@ class TaskRuntime:
             return self.task_store.update(failed)
 
         status = _status_from_result(result)
+        if status is TaskStatus.NEEDS_AUTH:
+            result = attach_auth_url(self.settings, running.task_id, result)
         finished = running.transition(status, result=result)
         return self.task_store.update(finished)
 
@@ -193,6 +196,13 @@ class BackgroundTaskRuntime:
 
     def submit(self, request: RuntimeRequest) -> Task:
         task = self._runtime.create_task(request, status=TaskStatus.QUEUED)
+        return self._enqueue(task, request)
+
+    def resume(self, task: Task, request: RuntimeRequest) -> Task:
+        queued = self._runtime.task_store.update(task.transition(TaskStatus.QUEUED))
+        return self._enqueue(queued, request)
+
+    def _enqueue(self, task: Task, request: RuntimeRequest) -> Task:
         try:
             future = self._executor.submit(self._runtime.execute_task, task, request)
         except RuntimeError as exc:
