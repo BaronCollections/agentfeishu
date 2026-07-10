@@ -364,6 +364,80 @@ def test_browser_loading_state_is_not_treated_as_extracted_content():
     )
 
 
+def test_browser_extract_falls_back_to_visible_capture_on_loading(monkeypatch, tmp_path):
+    settings = load_settings(tmp_path)
+    profile_dir = browser_auth.profile_dir_for_url(settings, "https://www.douyin.com/video/1")
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "Local State").write_text("{}", encoding="utf-8")
+    calls: list[dict[str, object]] = []
+
+    def fake_extract_once(
+        url, settings, sync_playwright, *, timeout_s, headless, wait_after_load_s
+    ):
+        calls.append({
+            "headless": headless,
+            "wait_after_load_s": wait_after_load_s,
+        })
+        if headless:
+            return UrlIngestReport(
+                input_url=url,
+                resolved_url=url,
+                content_type="browser_page",
+                text="视频数据加载中",
+                limitations=(Limitation(
+                    code="browser_content_loading",
+                    message="loading",
+                    recoverable=True,
+                ),),
+            )
+        return UrlIngestReport(
+            input_url=url,
+            resolved_url=url,
+            content_type="video_page",
+            title="rendered video title",
+            text="章节要点\\n真实页面内容",
+        )
+
+    monkeypatch.setattr(browser_auth, "has_python_package", lambda package: True)
+    monkeypatch.setattr(browser_auth, "_browser_extract_once", fake_extract_once)
+    fake_playwright = types.ModuleType("playwright")
+    fake_sync_api = types.ModuleType("playwright.sync_api")
+    fake_sync_api.sync_playwright = lambda: None
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync_api)
+
+    report = browser_auth.try_browser_extract("https://www.douyin.com/video/1", settings)
+
+    assert report is not None
+    assert report.content_type == "video_page"
+    assert report.title == "rendered video title"
+    assert report.limitations == ()
+    assert calls == [
+        {"headless": True, "wait_after_load_s": 1},
+        {"headless": False, "wait_after_load_s": 8},
+    ]
+
+
+def test_douyin_browser_text_is_cleaned_and_title_can_be_inferred():
+    raw = "\n".join([
+        "精选",
+        "推荐",
+        "2026 © 抖音",
+        "京ICP备16016397号-3",
+        "章节要点：共10个",
+        "作者声明：内容由 AI 生成",
+        "章节要点",
+        "超强台风巴威从8级迅速增强至17级。",
+        "第185集 | 台风巴威超17级，强度堪比摩羯",
+    ])
+
+    cleaned = browser_auth._clean_browser_text("https://www.douyin.com/video/1", raw)
+
+    assert cleaned.startswith("章节要点：共10个")
+    assert "京ICP备" not in cleaned
+    assert browser_auth._infer_title_from_text("", cleaned) == "台风巴威超17级，强度堪比摩羯"
+
+
 def test_url_resolution_error_returns_structured_limitation(monkeypatch, tmp_path):
     monkeypatch.setattr(
         extractors,

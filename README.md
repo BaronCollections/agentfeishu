@@ -67,16 +67,20 @@ Pipeline:
 3. Try `gallery-dl` for image and gallery URLs.
 4. Try `trafilatura` for article text.
 5. Reuse a project-local Playwright persistent profile when one exists.
-6. Return a browser-auth required result for JS/login/anti-automation pages.
+6. For supported authorized sites, retry with a short visible-browser capture
+   when headless extraction only sees a loading shell.
+7. Return a browser-auth required result for JS/login/anti-automation pages.
 
 AgentFeishu does not bypass login, defeat paywalls, or evade access controls. If a page requires login, the capability returns `needs_browser_auth` and points to the project-local browser profile directory under `state/browser_profiles/<site>`.
 
 A browser profile directory by itself is not treated as proof of authorization.
 For supported sites such as Douyin, AgentFeishu marks auth ready only after it
-sees configured login cookies. If a user-authorized profile opens the page but
-the platform still exposes only a loading shell, URL ingestion returns `partial`
-with a limitation such as `browser_content_loading` instead of asking the user to
-login again or guessing from share text.
+sees configured login cookies. If headless extraction only sees a loading shell,
+AgentFeishu can briefly open a visible browser with the same authorized profile,
+capture rendered page text and a screenshot artifact, then close it. If that
+visible capture still fails, URL ingestion returns `partial` with a limitation
+such as `browser_content_loading` instead of asking the user to login again or
+guessing from share text.
 
 To authorize a site with an installed `url-ingest` extra:
 
