@@ -418,6 +418,53 @@ def test_browser_extract_falls_back_to_visible_capture_on_loading(monkeypatch, t
     ]
 
 
+def test_browser_extract_retries_transient_douyin_unavailable_state(monkeypatch, tmp_path):
+    settings = load_settings(tmp_path)
+    profile_dir = browser_auth.profile_dir_for_url(settings, "https://www.douyin.com/video/1")
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "Local State").write_text("{}", encoding="utf-8")
+    calls: list[bool] = []
+
+    def fake_extract_once(
+        url, settings, sync_playwright, *, timeout_s, headless, wait_after_load_s
+    ):
+        calls.append(headless)
+        if len(calls) < 3:
+            return UrlIngestReport(
+                input_url=url,
+                resolved_url=url,
+                content_type="video_page",
+                text="你要观看的视频不存在",
+                limitations=(Limitation(
+                    code="browser_video_unavailable_state",
+                    message="transient unavailable",
+                    recoverable=True,
+                ),),
+            )
+        return UrlIngestReport(
+            input_url=url,
+            resolved_url=url,
+            content_type="video_page",
+            title="real video title",
+            text="作者声明：内容由 AI 生成\n章节要点",
+        )
+
+    monkeypatch.setattr(browser_auth, "has_python_package", lambda package: True)
+    monkeypatch.setattr(browser_auth, "_browser_extract_once", fake_extract_once)
+    fake_playwright = types.ModuleType("playwright")
+    fake_sync_api = types.ModuleType("playwright.sync_api")
+    fake_sync_api.sync_playwright = lambda: None
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync_api)
+
+    report = browser_auth.try_browser_extract("https://www.douyin.com/video/1", settings)
+
+    assert report is not None
+    assert report.title == "real video title"
+    assert report.limitations == ()
+    assert calls == [True, False, False]
+
+
 def test_douyin_browser_text_is_cleaned_and_title_can_be_inferred():
     raw = "\n".join([
         "精选",
@@ -436,6 +483,14 @@ def test_douyin_browser_text_is_cleaned_and_title_can_be_inferred():
     assert cleaned.startswith("章节要点：共10个")
     assert "京ICP备" not in cleaned
     assert browser_auth._infer_title_from_text("", cleaned) == "台风巴威超17级，强度堪比摩羯"
+
+
+def test_douyin_unavailable_text_is_not_treated_as_success():
+    assert browser_auth._looks_like_video_unavailable_state(
+        "https://www.douyin.com/video/1",
+        "在抖音记录美好生活20260710 - 抖音",
+        "你要观看的视频不存在",
+    )
 
 
 def test_url_resolution_error_returns_structured_limitation(monkeypatch, tmp_path):

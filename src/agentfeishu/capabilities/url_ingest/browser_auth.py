@@ -368,23 +368,23 @@ def try_browser_extract(url: str, settings: Settings,
         headless=True,
         wait_after_load_s=1,
     )
-    if (
-        report
-        and _report_has_limitation(report, "browser_content_loading")
-        and _visible_browser_fallback_enabled(settings, url)
+    if report and _should_retry_with_visible_browser(report) and (
+        _visible_browser_fallback_enabled(settings, url)
     ):
-        visible_report = _browser_extract_once(
-            url,
-            settings,
-            sync_playwright,
-            timeout_s=timeout_s,
-            headless=False,
-            wait_after_load_s=_visible_browser_wait_s(settings),
-        )
-        if visible_report and not _report_has_limitation(
-            visible_report, "browser_content_loading"
-        ):
-            return visible_report
+        best_report = report
+        for _ in range(_visible_browser_attempts(settings)):
+            visible_report = _browser_extract_once(
+                url,
+                settings,
+                sync_playwright,
+                timeout_s=timeout_s,
+                headless=False,
+                wait_after_load_s=_visible_browser_wait_s(settings),
+            )
+            if not _should_retry_with_visible_browser(visible_report):
+                return visible_report
+            best_report = visible_report
+        return best_report
     return report
 
 
@@ -501,6 +501,25 @@ def _browser_extract_once(
                 next_action="retry_with_visible_browser",
             ),),
         )
+    if _looks_like_video_unavailable_state(current_url, title, body_text):
+        return UrlIngestReport(
+            input_url=url,
+            resolved_url=current_url,
+            content_type="video_page",
+            title=title,
+            text=body_text[:2000],
+            artifacts=artifacts,
+            evidence=evidence,
+            limitations=(Limitation(
+                code="browser_video_unavailable_state",
+                message=(
+                    "The video page returned a transient unavailable/not-found "
+                    "state while using an authorized browser profile."
+                ),
+                recoverable=True,
+                next_action="retry_visible_browser_capture",
+            ),),
+        )
     cleaned_text = _clean_browser_text(current_url, body_text)
     inferred_title = _infer_title_from_text(title, cleaned_text)
     return UrlIngestReport(
@@ -565,6 +584,25 @@ def _visible_browser_wait_s(settings: Settings) -> int:
         return 8
 
 
+def _visible_browser_attempts(settings: Settings) -> int:
+    configured = settings.capability_settings.get("url_ingest", {})
+    raw = configured.get("visible_browser_attempts", 3)
+    try:
+        return max(1, min(int(raw), 5))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _should_retry_with_visible_browser(report: UrlIngestReport) -> bool:
+    return any(
+        item.code in {
+            "browser_content_loading",
+            "browser_video_unavailable_state",
+        }
+        for item in report.limitations
+    )
+
+
 def _report_has_limitation(report: UrlIngestReport, code: str) -> bool:
     return any(item.code == code for item in report.limitations)
 
@@ -622,5 +660,18 @@ def _looks_like_loading_state(url: str, title: str, body_text: str) -> bool:
             "视频数据加载中",
             "data loading",
             "loading video",
+        )
+    )
+
+
+def _looks_like_video_unavailable_state(url: str, title: str, body_text: str) -> bool:
+    low = " ".join([url, title, body_text[:1500]]).lower()
+    return any(
+        marker in low
+        for marker in (
+            "你要观看的视频不存在",
+            "视频不存在",
+            "video does not exist",
+            "video unavailable",
         )
     )
