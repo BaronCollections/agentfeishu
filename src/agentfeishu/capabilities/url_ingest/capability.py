@@ -110,7 +110,7 @@ class UrlIngestCapability:
         if any(item.code == "needs_browser_auth" for item in report.limitations):
             status = "needs_browser_auth"
             next_action = "open_browser_login"
-        elif report.limitations and not report.text and not report.title:
+        elif report.limitations:
             status = "partial"
         summary = _summary_from_report(report)
         return CapabilityResult(

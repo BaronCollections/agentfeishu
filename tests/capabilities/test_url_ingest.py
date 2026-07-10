@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import sys
+import types
+
 from agentfeishu.capabilities.url_ingest import UrlIngestCapability
+from agentfeishu.capabilities.url_ingest import browser_auth
+from agentfeishu.capabilities.url_ingest import capability as capability_module
 from agentfeishu.capabilities.url_ingest import extractors
 from agentfeishu.capabilities.url_ingest.extractors import ExtractionContext, extract_urls, ingest_url
 from agentfeishu.capabilities.url_ingest.models import UrlIngestReport
@@ -21,6 +26,37 @@ def test_url_ingest_requires_url(tmp_path):
     )
     assert result.status == "failed"
     assert result.limitations[0].code == "missing_url"
+
+
+def test_url_ingest_marks_limited_reports_partial(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        capability_module,
+        "ingest_url",
+        lambda url, context: UrlIngestReport(
+            input_url=url,
+            resolved_url=url,
+            content_type="browser_page",
+            text="视频数据加载中",
+            limitations=(Limitation(
+                code="browser_content_loading",
+                message="still loading",
+                recoverable=True,
+            ),),
+        ),
+    )
+    capability = UrlIngestCapability()
+
+    result = capability.execute(
+        CapabilityRequest(
+            capability="url_ingest",
+            payload={"url": "https://www.douyin.com/video/1"},
+            raw_text="https://www.douyin.com/video/1",
+        ),
+        load_settings(tmp_path),
+    )
+
+    assert result.status == "partial"
+    assert result.limitations[0].code == "browser_content_loading"
 
 
 def test_url_ingest_health_reports_dependencies(tmp_path):
@@ -193,6 +229,95 @@ def test_browser_profile_extractor_can_complete_dynamic_page(monkeypatch, tmp_pa
     assert report.content_type == "browser_page"
     assert report.title == "Private dashboard"
     assert report.text == "authorized content"
+
+
+def test_ytdlp_uses_exported_browser_profile_cookies(monkeypatch, tmp_path):
+    settings = load_settings(tmp_path)
+    cookiefile = tmp_path / "cookies.txt"
+    captured_options = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured_options.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {
+                "id": "video_1",
+                "title": "video title",
+                "description": "video text",
+                "webpage_url": url,
+            }
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+    monkeypatch.setattr(extractors, "has_python_package", lambda package: True)
+    monkeypatch.setattr(
+        extractors,
+        "export_profile_cookies",
+        lambda settings, url: cookiefile,
+    )
+
+    report = extractors._try_ytdlp(
+        "https://v.douyin.com/example/",
+        "https://www.douyin.com/video/1",
+        ExtractionContext(settings=settings),
+    )
+
+    assert report is not None
+    assert report.title == "video title"
+    assert captured_options["cookiefile"] == str(cookiefile)
+
+
+def test_ytdlp_auth_error_after_cookie_export_is_not_reported_as_missing_auth(
+    monkeypatch,
+    tmp_path,
+):
+    settings = load_settings(tmp_path)
+    cookiefile = tmp_path / "cookies.txt"
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            raise RuntimeError("Fresh cookies (not necessarily logged in) are needed")
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+    monkeypatch.setattr(extractors, "has_python_package", lambda package: True)
+    monkeypatch.setattr(
+        extractors,
+        "export_profile_cookies",
+        lambda settings, url: cookiefile,
+    )
+
+    report = extractors._try_ytdlp(
+        "https://v.douyin.com/example/",
+        "https://www.douyin.com/video/1",
+        ExtractionContext(settings=settings),
+    )
+
+    assert report is not None
+    assert report.limitations[0].code == "extractor_auth_rejected"
+    assert "needs_browser_auth" not in {item.code for item in report.limitations}
+
+
+def test_browser_loading_state_is_not_treated_as_extracted_content():
+    assert browser_auth._looks_like_loading_state(
+        "https://www.douyin.com/video/1",
+        "",
+        "精选\\n推荐\\n视频数据加载中",
+    )
 
 
 def test_url_resolution_error_returns_structured_limitation(monkeypatch, tmp_path):

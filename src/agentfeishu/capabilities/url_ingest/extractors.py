@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from agentfeishu.config import Settings
 from agentfeishu.core.models import Evidence, Limitation
 
-from .browser_auth import profile_dir_for_url, try_browser_extract
+from .browser_auth import export_profile_cookies, profile_dir_for_url, try_browser_extract
 from .dependencies import has_python_package
 from .models import UrlArtifact, UrlIngestReport
 
@@ -260,6 +260,9 @@ def _try_ytdlp(input_url: str, final_url: str,
         "noplaylist": True,
         "outtmpl": output_template,
     }
+    cookiefile = export_profile_cookies(context.settings, final_url or input_url)
+    if cookiefile:
+        options["cookiefile"] = str(cookiefile)
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(final_url or input_url, download=False)
@@ -267,6 +270,30 @@ def _try_ytdlp(input_url: str, final_url: str,
         message = str(exc)
         if _looks_like_auth_error(message):
             site = urllib.parse.urlparse(final_url or input_url).netloc or "default"
+            if cookiefile:
+                return UrlIngestReport(
+                    input_url=input_url,
+                    resolved_url=final_url,
+                    content_type="video",
+                    evidence=(
+                        Evidence(kind="extractor_error", value=message, source="yt-dlp"),
+                        Evidence(
+                            kind="browser_cookies",
+                            value=str(cookiefile),
+                            source=site,
+                            confidence="high",
+                        ),
+                    ),
+                    limitations=(Limitation(
+                        code="extractor_auth_rejected",
+                        message=(
+                            "A user-authorized browser cookie file was supplied, "
+                            "but yt-dlp still could not read the video metadata."
+                        ),
+                        recoverable=True,
+                        next_action="try_browser_visible_capture_or_retry_later",
+                    ),),
+                )
             return UrlIngestReport(
                 input_url=input_url,
                 resolved_url=final_url,

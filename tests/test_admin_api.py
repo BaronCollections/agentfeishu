@@ -313,6 +313,53 @@ def test_auth_open_endpoint_resumes_after_browser_login(monkeypatch, tmp_path):
         thread.join(timeout=5)
 
 
+def test_auth_open_endpoint_resumes_after_browser_open_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(server_module, "has_python_package", lambda package: True)
+
+    def fake_open_browser_login(settings, url):
+        raise RuntimeError("existing browser session")
+
+    monkeypatch.setattr(server_module, "open_browser_login", fake_open_browser_login)
+    capability = NeedsAuthThenSuccessCapability()
+    registry = CapabilityRegistry()
+    registry.register(capability)
+    settings = load_settings(tmp_path)
+    server, thread = _start_server(settings, registry)
+    try:
+        port = server.server_address[1]
+        response = _post_json(
+            f"http://127.0.0.1:{port}/feishu/events",
+            {
+                "event": {
+                    "sender": {"sender_id": {"open_id": "ou_1"}},
+                    "message": {
+                        "message_id": "om_auth_open_failure",
+                        "chat_id": "oc_1",
+                        "message_type": "text",
+                        "content": '{"text":"解析 https://v.douyin.com/example/"}',
+                    },
+                }
+            },
+        )
+        task_id = response["data"]["task"]["id"]
+        assert _wait_for_task_status(settings, task_id, "needs_auth")
+        task = _latest_task(settings, task_id)
+        token = parse_qs(urlparse(task["result"]["data"]["auth_url"]).query)["token"][0]
+
+        opened = _post_json(
+            f"http://127.0.0.1:{port}/api/tasks/{task_id}/auth/open",
+            {"token": token},
+        )
+
+        assert opened["status"] == HTTPStatus.ACCEPTED
+        assert _wait_for_task_status(settings, task_id, "succeeded")
+        assert capability.calls == 2
+    finally:
+        server.RequestHandlerClass.shutdown_runtime()
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 class BlockingUrlCapability:
     descriptor = CapabilityDescriptor(
         capability_id="url_ingest",

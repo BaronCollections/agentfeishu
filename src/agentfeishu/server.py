@@ -671,7 +671,6 @@ def _open_browser_auth_and_resume_background(
         open_browser_login(settings, url)
     except Exception as exc:
         print(f"AgentFeishu browser auth failed for {url}: {exc}")
-        return
     runtime.resume(task, request)
 
 
