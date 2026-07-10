@@ -71,6 +71,13 @@ Pipeline:
 
 AgentFeishu does not bypass login, defeat paywalls, or evade access controls. If a page requires login, the capability returns `needs_browser_auth` and points to the project-local browser profile directory under `state/browser_profiles/<site>`.
 
+A browser profile directory by itself is not treated as proof of authorization.
+For supported sites such as Douyin, AgentFeishu marks auth ready only after it
+sees configured login cookies. If a user-authorized profile opens the page but
+the platform still exposes only a loading shell, URL ingestion returns `partial`
+with a limitation such as `browser_content_loading` instead of asking the user to
+login again or guessing from share text.
+
 To authorize a site with an installed `url-ingest` extra:
 
 ```bash
@@ -87,9 +94,10 @@ http://127.0.0.1:8765/auth/start?task_id=...&token=...
 ```
 
 Open that link on the machine running AgentFeishu, click **Open Browser Login**,
-complete the site login, and close the browser window. AgentFeishu then requeues
-the original task with the same task id and reuses the saved project-local
-browser profile. The page also keeps **Continue Parsing** as a manual fallback.
+complete the site login, and wait for AgentFeishu to detect a known login
+cookie. After authorization is detected, AgentFeishu requeues the original task
+with the same task id and reuses the saved project-local browser profile. The
+page also keeps **Continue Parsing** as a manual fallback.
 Configure the link base with:
 
 ```toml

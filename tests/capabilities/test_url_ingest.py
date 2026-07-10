@@ -10,7 +10,7 @@ from agentfeishu.capabilities.url_ingest import extractors
 from agentfeishu.capabilities.url_ingest.extractors import ExtractionContext, extract_urls, ingest_url
 from agentfeishu.capabilities.url_ingest.models import UrlIngestReport
 from agentfeishu.config import load_settings
-from agentfeishu.core import CapabilityRequest, Limitation
+from agentfeishu.core import AuthState, CapabilityRequest, Limitation
 
 
 def test_extract_urls_from_mixed_text():
@@ -56,6 +56,7 @@ def test_url_ingest_marks_limited_reports_partial(monkeypatch, tmp_path):
     )
 
     assert result.status == "partial"
+    assert result.summary == "still loading"
     assert result.limitations[0].code == "browser_content_loading"
 
 
@@ -68,6 +69,47 @@ def test_url_ingest_health_reports_dependencies(tmp_path):
     assert health.configuration["browser_profiles_dir"].endswith("browser_profiles")
     assert health.auth_state.value == "required"
     assert health.configuration["auth_targets"][0]["login_url"] == "https://www.douyin.com/"
+
+
+def test_douyin_short_and_www_hosts_share_authorized_profile_key(tmp_path):
+    settings = load_settings(tmp_path)
+
+    assert browser_auth.site_key_from_url("https://v.douyin.com/example/") == "www_douyin_com"
+    assert (
+        browser_auth.profile_dir_for_url(settings, "https://v.douyin.com/example/")
+        == browser_auth.profile_dir_for_url(settings, "https://www.douyin.com/")
+    )
+
+
+def test_nonempty_profile_without_login_cookie_is_unknown_auth_state(tmp_path):
+    settings = load_settings(tmp_path)
+    profile_dir = browser_auth.profile_dir_for_url(settings, "https://www.douyin.com/")
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "Local State").write_text("{}", encoding="utf-8")
+
+    assert browser_auth.profile_state(profile_dir) is AuthState.READY
+    assert (
+        browser_auth.authorization_state_for_url(settings, "https://www.douyin.com/")
+        is AuthState.UNKNOWN
+    )
+
+
+def test_cookiefile_with_login_cookie_marks_authorization_ready(tmp_path):
+    settings = load_settings(tmp_path)
+    cookies_dir = settings.state_dir / "cookies"
+    cookies_dir.mkdir(parents=True)
+    (cookies_dir / "www_douyin_com.txt").write_text(
+        "\n".join([
+            "# Netscape HTTP Cookie File",
+            ".douyin.com\tTRUE\t/\tTRUE\t0\tsessionid\tabc",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        browser_auth.authorization_state_for_url(settings, "https://v.douyin.com/example/")
+        is AuthState.READY
+    )
 
 
 def test_login_page_returns_browser_auth_limitation(monkeypatch, tmp_path):
@@ -271,6 +313,8 @@ def test_ytdlp_uses_exported_browser_profile_cookies(monkeypatch, tmp_path):
     assert report is not None
     assert report.title == "video title"
     assert captured_options["cookiefile"] == str(cookiefile)
+    assert captured_options["no_warnings"] is True
+    assert hasattr(captured_options["logger"], "error")
 
 
 def test_ytdlp_auth_error_after_cookie_export_is_not_reported_as_missing_auth(

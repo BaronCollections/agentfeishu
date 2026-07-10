@@ -33,6 +33,17 @@ class ExtractionContext:
     timeout_s: int = 20
 
 
+class _SilentYtDlpLogger:
+    def debug(self, message: str) -> None:
+        return
+
+    def warning(self, message: str) -> None:
+        return
+
+    def error(self, message: str) -> None:
+        return
+
+
 def extract_urls(text: str) -> list[str]:
     return [match.group(0).rstrip("，,。") for match in URL_RE.finditer(text)]
 
@@ -256,6 +267,8 @@ def _try_ytdlp(input_url: str, final_url: str,
     output_template = str(context.settings.downloads_dir / "%(id)s.%(ext)s")
     options = {
         "quiet": True,
+        "no_warnings": True,
+        "logger": _SilentYtDlpLogger(),
         "skip_download": True,
         "noplaylist": True,
         "outtmpl": output_template,

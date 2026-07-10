@@ -13,6 +13,7 @@ from agentfeishu.capabilities import default_registry
 from agentfeishu.capabilities.url_ingest import extractors
 from agentfeishu.config import load_settings
 from agentfeishu.core import (
+    AuthState,
     CapabilityDescriptor,
     CapabilityHealth,
     CapabilityResult,
@@ -265,9 +266,9 @@ def test_auth_open_endpoint_resumes_after_browser_login(monkeypatch, tmp_path):
     monkeypatch.setattr(server_module, "has_python_package", lambda package: True)
     opened_urls: list[str] = []
 
-    def fake_open_browser_login(settings, url):
+    def fake_open_browser_login(settings, url, **kwargs):
         opened_urls.append(url)
-        return {"status": "closed"}
+        return {"state": "authorized"}
 
     monkeypatch.setattr(server_module, "open_browser_login", fake_open_browser_login)
     capability = NeedsAuthThenSuccessCapability()
@@ -313,10 +314,18 @@ def test_auth_open_endpoint_resumes_after_browser_login(monkeypatch, tmp_path):
         thread.join(timeout=5)
 
 
-def test_auth_open_endpoint_resumes_after_browser_open_failure(monkeypatch, tmp_path):
+def test_auth_open_endpoint_keeps_task_waiting_when_browser_open_fails_without_auth(
+    monkeypatch,
+    tmp_path,
+):
     monkeypatch.setattr(server_module, "has_python_package", lambda package: True)
+    monkeypatch.setattr(
+        server_module,
+        "authorization_state_for_url",
+        lambda settings, url: AuthState.REQUIRED,
+    )
 
-    def fake_open_browser_login(settings, url):
+    def fake_open_browser_login(settings, url, **kwargs):
         raise RuntimeError("existing browser session")
 
     monkeypatch.setattr(server_module, "open_browser_login", fake_open_browser_login)
@@ -334,6 +343,61 @@ def test_auth_open_endpoint_resumes_after_browser_open_failure(monkeypatch, tmp_
                     "sender": {"sender_id": {"open_id": "ou_1"}},
                     "message": {
                         "message_id": "om_auth_open_failure",
+                        "chat_id": "oc_1",
+                        "message_type": "text",
+                        "content": '{"text":"解析 https://v.douyin.com/example/"}',
+                    },
+                }
+            },
+        )
+        task_id = response["data"]["task"]["id"]
+        assert _wait_for_task_status(settings, task_id, "needs_auth")
+        task = _latest_task(settings, task_id)
+        token = parse_qs(urlparse(task["result"]["data"]["auth_url"]).query)["token"][0]
+
+        opened = _post_json(
+            f"http://127.0.0.1:{port}/api/tasks/{task_id}/auth/open",
+            {"token": token},
+        )
+
+        assert opened["status"] == HTTPStatus.ACCEPTED
+        assert _wait_for_task_status(settings, task_id, "waiting_for_auth")
+        assert capability.calls == 1
+    finally:
+        server.RequestHandlerClass.shutdown_runtime()
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_auth_open_endpoint_resumes_after_browser_open_failure_if_auth_exists(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(server_module, "has_python_package", lambda package: True)
+    monkeypatch.setattr(
+        server_module,
+        "authorization_state_for_url",
+        lambda settings, url: AuthState.READY,
+    )
+
+    def fake_open_browser_login(settings, url, **kwargs):
+        raise RuntimeError("existing browser session")
+
+    monkeypatch.setattr(server_module, "open_browser_login", fake_open_browser_login)
+    capability = NeedsAuthThenSuccessCapability()
+    registry = CapabilityRegistry()
+    registry.register(capability)
+    settings = load_settings(tmp_path)
+    server, thread = _start_server(settings, registry)
+    try:
+        port = server.server_address[1]
+        response = _post_json(
+            f"http://127.0.0.1:{port}/feishu/events",
+            {
+                "event": {
+                    "sender": {"sender_id": {"open_id": "ou_1"}},
+                    "message": {
+                        "message_id": "om_auth_open_failure_has_auth",
                         "chat_id": "oc_1",
                         "message_type": "text",
                         "content": '{"text":"解析 https://v.douyin.com/example/"}',

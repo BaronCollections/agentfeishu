@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from agentfeishu.capabilities import default_registry
 from agentfeishu.capabilities.url_ingest.browser_auth import (
+    authorization_state_for_url,
     open_browser_login,
     profile_dir_for_url,
 )
@@ -26,6 +27,7 @@ from agentfeishu.core.models import (
     RuntimeRequest,
     Task,
     TaskStatus,
+    AuthState,
     to_jsonable,
 )
 from agentfeishu.core.task_store import TaskStore
@@ -74,6 +76,19 @@ def make_handler(settings: Settings, registry: CapabilityRegistry):
         task_store=task_store,
         settings=settings,
     )
+    auth_resume_lock = threading.Lock()
+
+    def resume_auth_task_if_waiting(task_id: str, request: RuntimeRequest) -> Task | None:
+        with auth_resume_lock:
+            task = _task_row(task_store, task_id)
+            if task is None:
+                return None
+            if task.get("status") not in {
+                TaskStatus.NEEDS_AUTH.value,
+                TaskStatus.WAITING_FOR_AUTH.value,
+            }:
+                return None
+            return background_runtime.resume(_task_from_row(task), request)
 
     class AdminHandler(BaseHTTPRequestHandler):
         server_version = "AgentFeishuAdmin/0.1"
@@ -285,7 +300,7 @@ def make_handler(settings: Settings, registry: CapabilityRegistry):
                 args=(
                     settings,
                     login_url,
-                    background_runtime,
+                    resume_auth_task_if_waiting,
                     waiting,
                     _runtime_request_from_task_row(task),
                 ),
@@ -355,10 +370,16 @@ def make_handler(settings: Settings, registry: CapabilityRegistry):
                     "status": task.get("status"),
                 }, HTTPStatus.CONFLICT)
                 return
-            resumed = background_runtime.resume(
-                _task_from_row(task),
+            resumed = resume_auth_task_if_waiting(
+                task_id,
                 _runtime_request_from_task_row(task),
             )
+            if resumed is None:
+                self._send_json({
+                    "error": "task_not_waiting_for_auth",
+                    "status": task.get("status"),
+                }, HTTPStatus.CONFLICT)
+                return
             self._send_json({"code": 0, "task": to_jsonable(resumed)}, HTTPStatus.ACCEPTED)
 
         def _allow_admin_request(self) -> bool:
@@ -663,15 +684,35 @@ def _open_browser_auth_background(settings: Settings, url: str) -> None:
 def _open_browser_auth_and_resume_background(
     settings: Settings,
     url: str,
-    runtime: BackgroundTaskRuntime,
+    resume_task_if_waiting,
     task: Task,
     request: RuntimeRequest,
 ) -> None:
+    result: dict[str, str] | None = None
     try:
-        open_browser_login(settings, url)
+        result = open_browser_login(
+            settings,
+            url,
+            wait_for_authorization=True,
+        )
     except Exception as exc:
         print(f"AgentFeishu browser auth failed for {url}: {exc}")
-    runtime.resume(task, request)
+    authorized = (
+        (result or {}).get("state") == "authorized"
+        or authorization_state_for_url(settings, url) is AuthState.READY
+    )
+    if not authorized:
+        print(
+            "AgentFeishu browser auth did not detect a reusable "
+            f"authorized session for {url}; task {task.task_id} remains waiting."
+        )
+        return
+    resumed = resume_task_if_waiting(task.task_id, request)
+    if resumed is None:
+        print(
+            "AgentFeishu skipped auth resume because task "
+            f"{task.task_id} is no longer waiting for authorization."
+        )
 
 
 def _is_admin_path(path: str) -> bool:

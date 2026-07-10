@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from agentfeishu.config import Settings
 from agentfeishu.core.models import AuthState, Evidence, Limitation
@@ -15,6 +17,16 @@ from .models import UrlIngestReport
 
 DEFAULT_AUTH_TARGETS = {
     "douyin": "https://www.douyin.com/",
+}
+
+DEFAULT_AUTH_COOKIE_NAMES = {
+    "douyin.com": (
+        "sessionid",
+        "sessionid_ss",
+        "sid_tt",
+        "uid_tt",
+        "uid_tt_ss",
+    ),
 }
 
 
@@ -28,6 +40,8 @@ class BrowserAuthTarget:
 
 def site_key_from_url(url: str) -> str:
     host = urllib.parse.urlparse(url).netloc.lower() or "default"
+    if _host_matches(host, "douyin.com"):
+        return "www_douyin_com"
     return host.replace(".", "_").replace(":", "_")
 
 
@@ -46,6 +60,16 @@ def profile_state(profile_dir: Path) -> AuthState:
     return AuthState.REQUIRED
 
 
+def authorization_state_for_url(settings: Settings, url: str) -> AuthState:
+    """Return whether a project-local profile has proven login cookies."""
+
+    if _cookiefile_has_authorization(settings, url):
+        return AuthState.READY
+    if profile_state(profile_dir_for_url(settings, url)) is AuthState.READY:
+        return AuthState.UNKNOWN
+    return AuthState.REQUIRED
+
+
 def auth_targets(settings: Settings) -> tuple[BrowserAuthTarget, ...]:
     targets = []
     configured = settings.capability_settings.get("url_ingest", {}).get("auth_targets")
@@ -58,7 +82,7 @@ def auth_targets(settings: Settings) -> tuple[BrowserAuthTarget, ...]:
             site=str(site),
             login_url=login_url,
             profile_dir=profile_dir,
-            state=profile_state(profile_dir),
+            state=authorization_state_for_url(settings, login_url),
         ))
     return tuple(targets)
 
@@ -72,11 +96,20 @@ def aggregate_auth_state(settings: Settings) -> AuthState:
     return AuthState.UNKNOWN
 
 
-def open_browser_login(settings: Settings, url: str) -> dict[str, str]:
+def open_browser_login(
+    settings: Settings,
+    url: str,
+    *,
+    wait_for_authorization: bool = False,
+    max_wait_s: int = 300,
+    poll_interval_s: float = 1.0,
+) -> dict[str, str]:
     """Open a headed persistent browser profile for user login.
 
     The call blocks until the browser window is closed. This is intentional for
-    the CLI command; the HTTP API starts it in a background thread.
+    the CLI command; the HTTP API starts it in a background thread. When
+    `wait_for_authorization` is enabled, known site-specific login cookies can
+    close the browser and release the profile before the user closes the window.
     """
 
     if not has_python_package("playwright"):
@@ -91,27 +124,121 @@ def open_browser_login(settings: Settings, url: str) -> dict[str, str]:
 
     profile_dir = profile_dir_for_url(settings, url)
     profile_dir.mkdir(parents=True, exist_ok=True)
+    state = "closed"
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             str(profile_dir),
             headless=False,
         )
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(1_000)
-        while True:
-            pages = [item for item in context.pages if not item.is_closed()]
-            if not pages:
-                break
-            try:
-                pages[0].wait_for_timeout(1_000)
-            except Exception:
-                break
         try:
-            context.close()
-        except Exception:
-            pass
-    return {"url": url, "profile_dir": str(profile_dir), "state": "closed"}
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(1_000)
+            deadline = time.monotonic() + max_wait_s
+            while True:
+                pages = [item for item in context.pages if not item.is_closed()]
+                if not pages:
+                    state = "closed"
+                    break
+                if wait_for_authorization and _context_has_authorization(
+                    context, settings, url
+                ):
+                    state = "authorized"
+                    break
+                if wait_for_authorization and max_wait_s > 0 and time.monotonic() >= deadline:
+                    state = "timeout"
+                    break
+                try:
+                    pages[0].wait_for_timeout(int(max(0.2, poll_interval_s) * 1000))
+                except Exception:
+                    state = "closed"
+                    break
+        finally:
+            try:
+                cookies = context.cookies()
+                if _cookies_indicate_authorized(
+                    url, cookies, _authorization_cookie_names_for_url(settings, url)
+                ):
+                    state = "authorized"
+                    _write_cookiefile(settings, url, cookies)
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
+    return {"url": url, "profile_dir": str(profile_dir), "state": state}
+
+
+def _context_has_authorization(context: Any, settings: Settings, url: str) -> bool:
+    cookie_names = _authorization_cookie_names_for_url(settings, url)
+    if not cookie_names:
+        return False
+    try:
+        cookies = context.cookies()
+    except Exception:
+        return False
+    return _cookies_indicate_authorized(url, cookies, cookie_names)
+
+
+def _authorization_cookie_names_for_url(settings: Settings, url: str) -> tuple[str, ...]:
+    configured = settings.capability_settings.get("url_ingest", {}).get("auth_cookie_names")
+    sources: list[dict[str, Any]] = [DEFAULT_AUTH_COOKIE_NAMES]
+    if isinstance(configured, dict):
+        sources.append(configured)
+    host = urllib.parse.urlparse(url).netloc.lower()
+    names: list[str] = []
+    for source in sources:
+        for host_pattern, raw_names in source.items():
+            if not _host_matches(host, str(host_pattern).lower()):
+                continue
+            if isinstance(raw_names, str):
+                raw_iterable = (raw_names,)
+            elif isinstance(raw_names, (list, tuple, set)):
+                raw_iterable = raw_names
+            else:
+                continue
+            for name in raw_iterable:
+                name = str(name).strip()
+                if name and name not in names:
+                    names.append(name)
+    return tuple(names)
+
+
+def _cookies_indicate_authorized(
+    url: str,
+    cookies: list[dict[str, Any]],
+    cookie_names: tuple[str, ...],
+) -> bool:
+    host = urllib.parse.urlparse(url).netloc.lower()
+    wanted = set(cookie_names)
+    now = time.time()
+    for cookie in cookies:
+        name = str(cookie.get("name") or "")
+        value = str(cookie.get("value") or "")
+        domain = str(cookie.get("domain") or "").lower()
+        if name not in wanted or not value or not _cookie_applies_to_host(domain, host):
+            continue
+        try:
+            expires = float(cookie.get("expires") or 0)
+        except (TypeError, ValueError):
+            expires = 0
+        if expires > 0 and expires < now:
+            continue
+        return True
+    return False
+
+
+def _host_matches(host: str, pattern: str) -> bool:
+    pattern = pattern.lstrip(".")
+    return host == pattern or host.endswith(f".{pattern}")
+
+
+def _cookie_applies_to_host(domain: str, host: str) -> bool:
+    if not domain:
+        return False
+    domain = domain.lstrip(".")
+    return host == domain or host.endswith(f".{domain}")
 
 
 def export_profile_cookies(settings: Settings, url: str) -> Path | None:
@@ -138,6 +265,11 @@ def export_profile_cookies(settings: Settings, url: str) -> Path | None:
     except Exception:
         return None
 
+    return _write_cookiefile(settings, url, cookies)
+
+
+def _write_cookiefile(settings: Settings, url: str,
+                      cookies: list[dict[str, Any]]) -> Path | None:
     if not cookies:
         return None
     cookies_dir = settings.state_dir / "cookies"
@@ -168,6 +300,33 @@ def export_profile_cookies(settings: Settings, url: str) -> Path | None:
     except OSError:
         pass
     return cookiefile
+
+
+def _cookiefile_has_authorization(settings: Settings, url: str) -> bool:
+    cookie_names = _authorization_cookie_names_for_url(settings, url)
+    if not cookie_names:
+        return False
+    cookiefile = settings.state_dir / "cookies" / f"{site_key_from_url(url)}.txt"
+    if not cookiefile.exists():
+        return False
+    cookies: list[dict[str, Any]] = []
+    try:
+        for line in cookiefile.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            domain, _, _, _, expires, name, value = parts[:7]
+            cookies.append({
+                "domain": domain,
+                "expires": expires,
+                "name": name,
+                "value": value,
+            })
+    except OSError:
+        return False
+    return _cookies_indicate_authorized(url, cookies, cookie_names)
 
 
 def try_browser_extract(url: str, settings: Settings,

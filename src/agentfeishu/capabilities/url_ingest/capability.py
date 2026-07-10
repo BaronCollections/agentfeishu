@@ -142,10 +142,10 @@ def _summary_from_report(report) -> str:
     )
     if auth_limitation:
         return auth_limitation.message
+    if report.limitations:
+        return report.limitations[0].message
     if report.title:
         return f"{report.content_type}: {report.title}"
     if report.text:
         return f"{report.content_type}: {report.text[:160]}"
-    if report.limitations:
-        return report.limitations[0].message
     return f"{report.content_type}: {report.resolved_url}"
